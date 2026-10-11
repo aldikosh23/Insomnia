@@ -111,8 +111,13 @@ The defaults are worth knowing:
 - **Heat:** Low Power Mode turned on for a serious thermal state stays on
   until the state is back to nominal, or until the session ends if it stays
   at fair. Switched off at fair, it would bring back the load that made the
-  Mac serious, and go on and off as the Mac heats up again. During a
-  session, a floor or the thermal rules changed in Settings apply at once.
+  Mac serious, and go on and off as the Mac heats up again. A serious state
+  that lasts 15 minutes without a break ends the session ("End after serious
+  heat for" in Settings, in 5-minute steps up to 60, or Off), since Apple
+  silicon throttles before it reaches critical and a Mac that cannot shed its
+  heat, in a bag say, can stay serious for hours. With the lid closed that
+  end puts the Mac to sleep, as the critical end does. During a session, a
+  floor or a heat setting changed in Settings applies at once.
 
 ## Upgrading from an earlier build
 

@@ -19,12 +19,18 @@ enum FloorRules {
 
     /// Ordered actions for the current inputs. `hot` says the thermal state
     /// read serious or critical earlier in the session and has not read
-    /// nominal since (`FloorRuleDriver` keeps it).
+    /// nominal since, and `seriousFor` how long it has read serious or
+    /// critical without a break, nil while it reads anything below serious
+    /// (`FloorRuleDriver` keeps both).
     ///
     /// - battery below `endFloor` while not charging: end session. 0 never
     ///   matches, so 0 turns the battery end off; Config keeps a non-zero
     ///   `endFloor` below `lowPowerFloor`.
     /// - thermal `critical` (if `thermalRules`): end session
+    /// - thermal `serious` for `seriousThermalLimit` without a break (if
+    ///   `thermalRules`; a limit of 0 turns this off): end session. Apple
+    ///   silicon throttles before it reaches critical, so a Mac that cannot
+    ///   shed its heat, in a bag say, can stay at serious for hours.
     /// - battery present but unreadable on two consecutive reads while not
     ///   charging, with an end floor set: end session. The floor cannot be
     ///   applied to a level nobody can read, and the Mac is on a battery
@@ -39,6 +45,7 @@ enum FloorRules {
         isCharging: Bool,
         thermal: ProcessInfo.ThermalState,
         hot: Bool,
+        seriousFor: TimeInterval?,
         lidClosed: Bool,
         lowPowerSetByUs: Bool,
         config: Config
@@ -50,6 +57,10 @@ enum FloorRules {
         }
         if config.thermalRules, thermal == .critical {
             return [.endSession(.thermalCritical)]
+        }
+        if config.thermalRules, config.seriousThermalLimit > 0, thermal == .serious,
+           let seriousFor, seriousFor >= config.seriousThermalLimit {
+            return [.endSession(.thermalSustained)]
         }
         if case let .unreadable(misses) = battery, onBattery, misses >= 2, config.endFloor > 0 {
             return [.endSession(.batteryUnreadable)]
@@ -102,10 +113,17 @@ struct FloorRuleDriver {
     /// so the matching disable knows whether it is announced. Not
     /// journaled: after a relaunch the disable is announced as before.
     private let lastCause = LastCause()
-    /// Whether the runs of this session have read serious or critical with
-    /// no nominal since (`FloorRules.evaluate`'s `hot`). Not journaled:
-    /// after a relaunch a Mac at fair counts as cooled down.
+    /// What the runs of this session have read of the heat
+    /// (`FloorRules.evaluate`'s `hot` and `seriousFor`). Not journaled:
+    /// after a relaunch a Mac at fair counts as cooled down, and a serious
+    /// stretch is timed from the first run that reads it.
     private let heatLog = HeatLog()
+    private let clock: @Sendable () -> Date
+    /// Called at the end of each run with the seconds until the serious
+    /// stretch reaches `seriousThermalLimit`, or nil when no run is owed
+    /// then: the thermal state sends no event while it stays serious, so
+    /// the caller runs the floors once more at that moment (spec section 6).
+    private let recheck: @MainActor (TimeInterval?) -> Void
 
     @MainActor
     private final class LastCause {
@@ -115,34 +133,49 @@ struct FloorRuleDriver {
     @MainActor
     private final class HeatLog {
         var hot = false
+        /// When the current serious stretch was first read.
+        var seriousSince: Date?
 
-        /// Records the state a run reads and returns whether the Mac
-        /// counts as hot for that run.
-        func read(_ thermal: ProcessInfo.ThermalState) -> Bool {
+        /// Records the state a run reads at `now` and returns the heat the
+        /// rules see for that run.
+        func read(_ thermal: ProcessInfo.ThermalState, at now: Date) -> (hot: Bool, seriousFor: TimeInterval?) {
             switch thermal {
-            case .serious, .critical: hot = true
-            case .nominal: hot = false
-            default: break
+            case .serious, .critical:
+                hot = true
+                if seriousSince == nil { seriousSince = now }
+            case .nominal:
+                hot = false
+                seriousSince = nil
+            default:
+                seriousSince = nil
             }
-            return hot
+            return (hot, seriousSince.map { now.timeIntervalSince($0) })
         }
     }
 
-    init(manager: SessionManager, notifier: any Notifying) {
+    init(
+        manager: SessionManager,
+        notifier: any Notifying,
+        clock: @escaping @Sendable () -> Date = { Date() },
+        recheck: @escaping @MainActor (TimeInterval?) -> Void = { _ in }
+    ) {
         self.manager = manager
         self.notifier = notifier
+        self.clock = clock
+        self.recheck = recheck
     }
 
     func run(battery: BatteryStatus, isCharging: Bool, thermal: ProcessInfo.ThermalState, lidClosed: Bool) async {
         guard let manager, manager.isActive, !Task.isCancelled else { return }
         let config = manager.config
         let percent = battery.percent
-        let hot = heatLog.read(thermal)
+        let (hot, seriousFor) = heatLog.read(thermal, at: clock())
         let actions = FloorRules.evaluate(
             battery: battery,
             isCharging: isCharging,
             thermal: thermal,
             hot: hot,
+            seriousFor: seriousFor,
             lidClosed: lidClosed,
             lowPowerSetByUs: manager.state.lowPowerSetByUs,
             config: config
@@ -187,5 +220,20 @@ struct FloorRuleDriver {
                 guard manager.isActive, !Task.isCancelled else { return }
             }
         }
+        recheck(secondsUntilSeriousThermalEnd())
+    }
+
+    /// Seconds until the serious stretch reaches `seriousThermalLimit`, or
+    /// nil when no run is owed: the state is not serious, the rule is off,
+    /// or the stretch has reached the limit already. A run that read it
+    /// there asked for the end, and the manager retries an end that was
+    /// refused (a busy lock, a power command still running), so the wait
+    /// is never rescheduled in a loop.
+    private func secondsUntilSeriousThermalEnd() -> TimeInterval? {
+        guard let manager, manager.isActive, let since = heatLog.seriousSince else { return nil }
+        let config = manager.config
+        guard config.thermalRules, config.seriousThermalLimit > 0 else { return nil }
+        let left = config.seriousThermalLimit - clock().timeIntervalSince(since)
+        return left > 0 ? left : nil
     }
 }

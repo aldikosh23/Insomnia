@@ -49,6 +49,22 @@ final class ClosedLidSleepTests: XCTestCase {
         XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
     }
 
+    /// Serious heat that lasts the limit with the lid closed, the case from
+    /// the bag that critical rarely reaches: the end asks for sleep too.
+    func testSustainedSeriousHeatWithTheLidClosedEndsTheSessionAndAsksForSleep() async throws {
+        let m = await sessionWithTheLidClosed(h)
+        let clock = h.clock
+        let driver = FloorRuleDriver(manager: m, notifier: h.notifier, clock: { clock.now })
+
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: true)
+        clock.advance(15 * 60)
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: true)
+
+        XCTAssertNil(m.session)
+        XCTAssertEqual(h.lidSleep.requests, [Self.asked])
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+    }
+
     func testBatteryEndsWithTheLidClosedAskForSleep() async {
         for reason in [EndReason.batteryFloor, .batteryUnreadable] {
             let h = Harness()

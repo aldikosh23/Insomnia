@@ -243,6 +243,7 @@ below cover what only a real Mac shows.
 - Settings floor steppers keep the end floor below the Low Power Mode floor by moving the other stepper
 - During a session on battery, a Low Power Mode floor raised above the charge in Settings switches the mode on within seconds and lowering it switches it off, and the thermal rules toggle applies at once
 - Heat hold when serious heat happens during a supervised session on a ventilated desk (never heat the Mac to test it): Low Power Mode comes on once, stays on at fair and goes off at nominal with "Thermal state is back to nominal."; the menu shows "Thermal: serious" and "Low Power Mode set by Insomnia" meanwhile
+- Sustained serious heat ends the session (as in the heat hold check, with "End after serious heat for" set to 5 minutes): a serious state that lasts that long ends it with "Thermal state stayed serious for 5 minutes.", and with the lid closed the Mac goes to sleep
 - First launch over an existing install tightens Application Support/Insomnia and Logs/Insomnia to 0700 and their files to 0600
 
 ### Lid close

@@ -91,6 +91,9 @@ final class AppServices {
     private var newestRelaunch: [String: Int] = [:]
     private var sampleTimer: (any DispatchSourceTimer)?
     private var postOpenSampleTask: Task<Void, Never>?
+    /// The floor run owed when a serious stretch reaches
+    /// `Config.seriousThermalLimit` (`scheduleSeriousThermalCheck`).
+    private var seriousThermalCheck: Task<Void, Never>?
     /// The state of the last lid event, from the hinge or the simulation
     /// trigger, run or refused. `status.lidClosed` is no stand-in for it:
     /// the menu's `refreshInstant` writes the raw registry there, which
@@ -145,7 +148,9 @@ final class AppServices {
         (notifier as? Notifier)?.requestAuthorizationIfNeeded()
 
         lidActions = LidActions(manager: manager, freezer: freezer, docker: docker, audio: audio, display: display, keyboard: keyboard, sampler: sampler)
-        floors = FloorRuleDriver(manager: manager, notifier: notifier)
+        floors = FloorRuleDriver(manager: manager, notifier: notifier, recheck: { [weak self] wait in
+            self?.scheduleSeriousThermalCheck(after: wait)
+        })
         // The panel under Insomnia's own Low Power Mode reads the mode's
         // rescaled value: sample once more just before the mode goes on
         // and keep that sample until it is off (spec section 4).
@@ -208,6 +213,8 @@ final class AppServices {
         sampleTimer = nil
         postOpenSampleTask?.cancel()
         postOpenSampleTask = nil
+        seriousThermalCheck?.cancel()
+        seriousThermalCheck = nil
         networkTask?.cancel()
         networkTask = nil
         for task in lidTasks { task.cancel() }
@@ -447,6 +454,21 @@ final class AppServices {
             self.syncState()
         }
         floorTasks.append(task)
+    }
+
+    /// The floor driver reports after each run when the serious stretch
+    /// reaches `Config.seriousThermalLimit` (spec section 6); one more run
+    /// is scheduled for that moment, and each report replaces the wait.
+    private func scheduleSeriousThermalCheck(after wait: TimeInterval?) {
+        seriousThermalCheck?.cancel()
+        seriousThermalCheck = nil
+        guard running, let wait else { return }
+        seriousThermalCheck = Task { @MainActor [weak self] in
+            // A second past the limit, so that run reads the stretch at it.
+            try? await Task.sleep(for: .seconds(wait + 1))
+            guard !Task.isCancelled else { return }
+            self?.powerChanged()
+        }
     }
 
     private func syncPower() {

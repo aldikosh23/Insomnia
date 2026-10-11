@@ -3,13 +3,15 @@ import XCTest
 
 final class FloorRulesTests: XCTestCase {
     /// nil is a machine with no battery (desktop). `hot`: serious or
-    /// critical read earlier in the session, with no nominal since.
-    func eval(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
-        eval(battery: percent.map { .percent($0) } ?? .none, charging: charging, thermal: thermal, hot: hot, lid: lid, lp: lp, config: config)
+    /// critical read earlier in the session, with no nominal since;
+    /// `seriousFor`: how long serious or critical has been read without a
+    /// break.
+    func eval(_ percent: Int?, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, seriousFor: TimeInterval? = nil, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
+        eval(battery: percent.map { .percent($0) } ?? .none, charging: charging, thermal: thermal, hot: hot, seriousFor: seriousFor, lid: lid, lp: lp, config: config)
     }
 
-    func eval(battery: BatteryStatus, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
-        FloorRules.evaluate(battery: battery, isCharging: charging, thermal: thermal, hot: hot, lidClosed: lid, lowPowerSetByUs: lp, config: config)
+    func eval(battery: BatteryStatus, charging: Bool = false, thermal: ProcessInfo.ThermalState = .nominal, hot: Bool = false, seriousFor: TimeInterval? = nil, lid: Bool = false, lp: Bool = false, config: Config = Config()) -> [FloorRules.Action] {
+        FloorRules.evaluate(battery: battery, isCharging: charging, thermal: thermal, hot: hot, seriousFor: seriousFor, lidClosed: lid, lowPowerSetByUs: lp, config: config)
     }
 
     // Row 1: battery below lowPowerFloor -> lowpowermode 1
@@ -75,6 +77,39 @@ final class FloorRulesTests: XCTestCase {
 
     func testBatteryEndFloorWinsOverThermalCritical() {
         XCTAssertEqual(eval(5, thermal: .critical), [.endSession(.batteryFloor)])
+    }
+
+    // Row 4b: thermal serious for seriousThermalLimit (15 minutes) without
+    // a break -> end session, on battery or on the charger.
+    func testSeriousHeatThatLastsTheLimitEndsTheSession() {
+        XCTAssertEqual(eval(80, thermal: .serious, hot: true, seriousFor: 15 * 60 - 1, lp: true), [])
+        XCTAssertEqual(eval(80, thermal: .serious, hot: true, seriousFor: 15 * 60, lp: true), [.endSession(.thermalSustained)])
+        XCTAssertEqual(eval(80, charging: true, thermal: .serious, hot: true, seriousFor: 15 * 60, lid: true, lp: true), [.endSession(.thermalSustained)])
+        XCTAssertEqual(eval(nil, thermal: .serious, hot: true, seriousFor: 3600), [.endSession(.thermalSustained)])
+        var c = Config()
+        c.seriousThermalLimit = 5 * 60
+        XCTAssertEqual(eval(80, thermal: .serious, hot: true, seriousFor: 299, lp: true, config: c), [])
+        XCTAssertEqual(eval(80, thermal: .serious, hot: true, seriousFor: 300, lp: true, config: c), [.endSession(.thermalSustained)])
+    }
+
+    func testSeriousHeatEndIsOffAtZeroAndWithTheThermalRulesOff() {
+        var zero = Config()
+        zero.seriousThermalLimit = 0
+        XCTAssertEqual(eval(80, thermal: .serious, hot: true, seriousFor: 3600, lp: true, config: zero), [])
+        XCTAssertEqual(eval(80, thermal: .critical, hot: true, seriousFor: 3600, config: zero), [.endSession(.thermalCritical)])
+        var off = Config()
+        off.thermalRules = false
+        XCTAssertEqual(eval(80, thermal: .serious, hot: true, seriousFor: 3600, config: off), [])
+    }
+
+    /// The battery end floor still comes first and critical names its own
+    /// reason; the heat end comes before an unreadable battery, as critical
+    /// does. Only a state that reads serious now ends anything.
+    func testSeriousHeatEndOrder() {
+        XCTAssertEqual(eval(5, thermal: .serious, hot: true, seriousFor: 3600), [.endSession(.batteryFloor)])
+        XCTAssertEqual(eval(80, thermal: .critical, hot: true, seriousFor: 3600), [.endSession(.thermalCritical)])
+        XCTAssertEqual(eval(battery: .unreadable(misses: 2), thermal: .serious, hot: true, seriousFor: 3600), [.endSession(.thermalSustained)])
+        XCTAssertEqual(eval(80, thermal: .fair, hot: true, seriousFor: 3600, lp: true), [])
     }
 
     // Row 2, unreadable: a battery that is present but cannot be read on
@@ -589,6 +624,122 @@ final class FloorRuleDriverTests: XCTestCase {
         XCTAssertFalse(h.guardFake.lowPowerOn, "fair with no serious since nominal switched the mode on")
     }
 
+    /// What the driver reports after each run about the run owed when the
+    /// serious stretch reaches the limit.
+    @MainActor
+    final class RecheckLog {
+        var waits: [TimeInterval?] = []
+    }
+
+    private func driver(_ m: SessionManager, _ log: RecheckLog) -> FloorRuleDriver {
+        let clock = h.clock
+        return FloorRuleDriver(manager: m, notifier: h.notifier, clock: { clock.now }, recheck: { log.waits.append($0) })
+    }
+
+    /// Serious heat that lasts the limit ends the session through the
+    /// journaled end, with its reason. The stretch is timed from the first
+    /// run that reads it, and each run reports when the run that ends it
+    /// is due, since no event comes while the state stays serious.
+    func testSeriousHeatThatLastsTheLimitEndsTheSession() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let log = RecheckLog()
+        let driver = driver(m, log)
+
+        await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: true)
+        XCTAssertTrue(h.guardFake.lowPowerOn)
+        h.clock.advance(10 * 60)
+        await driver.run(battery: .percent(78), isCharging: false, thermal: .serious, lidClosed: true)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(log.waits, [15 * 60, 5 * 60])
+
+        h.clock.advance(5 * 60)
+        await driver.run(battery: .percent(77), isCharging: false, thermal: .serious, lidClosed: true)
+        XCTAssertFalse(m.isActive)
+        XCTAssertNil(try h.store.loadSession())
+        XCTAssertEqual(try h.store.loadState(), RuntimeState.clean)
+        XCTAssertEqual(h.guardFake.calls.suffix(2), ["disablesleep 0", "lowpowermode 0"])
+        XCTAssertEqual(h.notifier.posts.last?.title, "Session ended")
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state stayed serious for 15 minutes. Sleep is back to normal.")
+    }
+
+    /// A reading below serious breaks the stretch and owes no run; the
+    /// next serious one starts the stretch again.
+    func testABreakInSeriousHeatStartsTheStretchAgain() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let log = RecheckLog()
+        let driver = driver(m, log)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        h.clock.advance(14 * 60)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .fair, lidClosed: false)
+        h.clock.advance(60)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        h.clock.advance(14 * 60)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        XCTAssertTrue(m.isActive, "the stretch before the break counted toward the limit")
+        XCTAssertEqual(log.waits, [15 * 60, nil, 15 * 60, 60])
+
+        h.clock.advance(60)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        XCTAssertFalse(m.isActive)
+    }
+
+    /// No run is owed with the end off or the thermal rules off, and a
+    /// shorter limit set in Settings applies to a stretch already running
+    /// at the run Settings queues.
+    func testTheHeatEndFollowsTheSettings() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let log = RecheckLog()
+        let driver = driver(m, log)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        h.clock.advance(6 * 60)
+        m.config.seriousThermalLimit = 0
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        m.config.seriousThermalLimit = 15 * 60
+        m.config.thermalRules = false
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        m.config.thermalRules = true
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        XCTAssertEqual(log.waits, [15 * 60, nil, nil, 9 * 60])
+
+        m.config.seriousThermalLimit = 5 * 60
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        XCTAssertFalse(m.isActive)
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state stayed serious for 5 minutes. Sleep is back to normal.")
+    }
+
+    /// An end at the limit that the recovery lock refuses keeps the
+    /// session, and the run owes no new wait: the manager retries the end
+    /// itself, so nothing asks for it every second.
+    func testARefusedHeatEndIsLeftToTheManagersRetry() async throws {
+        let m = h.makeManager(lockTimeout: 0.05)
+        await m.start(duration: 3600)
+        let log = RecheckLog()
+        let driver = driver(m, log)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
+        defer { other.release() }
+
+        h.clock.advance(15 * 60)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(m.pendingEnd, .thermalSustained)
+        XCTAssertEqual(log.waits, [15 * 60, nil])
+    }
+
+    /// The limit turned off between a refused end and its retry: the end
+    /// still names the heat, without a number.
+    func testAHeatEndWithTheLimitOffSaysSo() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        m.config.seriousThermalLimit = 0
+        await m.end(reason: .thermalSustained)
+        XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state stayed serious too long. Sleep is back to normal.")
+    }
+
     /// Thermal rules turned off while the mode is on for heat: the next run
     /// (Settings queues one) switches it off and says why.
     func testTurningTheThermalRulesOffReleasesHeatLowPowerAndSaysWhy() async throws {
@@ -617,14 +768,15 @@ final class FloorRuleDriverTests: XCTestCase {
         m.config.setLowPowerFloor(50)
         m.config.setEndFloor(20)
         m.config.thermalRules = false
+        m.config.seriousThermalLimit = 5 * 60
         m.config.lowPowerOnLidClose = false
-        XCTAssertEqual(asked, 4)
+        XCTAssertEqual(asked, 5)
 
         m.config.hotspotSSID = "iPhone"
         m.config.presets = [600]
         m.config.muteOnLidClose = false
         m.config.setLowPowerFloor(50)
-        XCTAssertEqual(asked, 4, "a change that is not a floor input, or no change, ran the floors")
+        XCTAssertEqual(asked, 5, "a change that is not a floor input, or no change, ran the floors")
     }
 
     /// The same path during a session, with the hook wired as `AppServices`

@@ -107,7 +107,8 @@ recovery; newly written journals use `frozenProcesses`.
   SleepDisabled 1 five seconds after pmset exits 0 (macOS 26.6.2 sets it back
   to 0 after about 2 s), delete the session file and surface the error. The
   journal and backstop always exist before sleep is disabled.
-- Session end (timer, End now, Quit, battery floor, thermal critical):
+- Session end (timer, End now, Quit, battery floor, thermal critical or
+  sustained serious):
   `sudo pmset -a disablesleep 0`, undo every RuntimeState entry, delete
   session, notify.
 - Quitting Insomnia always ends the session. There is no "keep awake after quit".
@@ -620,6 +621,7 @@ IOKit sends no event for a read that keeps failing.
 | battery present but unreadable on two consecutive reads, on battery, `endFloor` above 0 | end session, notify, sleep a closed lid | — |
 | thermal state `serious`, or `fair` with no `nominal` since a `serious` | `lowpowermode 1` | thermal back to `nominal`, or session end |
 | thermal state `critical` | end session, notify, sleep a closed lid | — |
+| thermal state `serious` without a break for `seriousThermalLimit` (default 15 minutes; 0 turns the end off) | end session, notify, sleep a closed lid | — |
 | lid closed (if `lowPowerOnLidClose`, charging or not) | `lowpowermode 1`, no notification | lid opened, or session end |
 
 `PowerMonitor` tells a machine with no internal battery (desktop: no floor
@@ -661,6 +663,21 @@ until the session ends. That is deliberate. A Mac at `fair` after `serious` is
 still carrying the heat, and a release on a timer would bring the cycling back
 at a slower pace. The menu shows the mode and the thermal state meanwhile, and
 turning the thermal rules off in Settings releases it at once.
+
+`critical` is rare on Apple silicon, which throttles before it gets there, so
+a Mac that cannot shed its heat, in a bag say, can stay `serious` for hours
+with Low Power Mode on. A `serious` stretch that lasts `seriousThermalLimit`
+ends the session (`thermalSustained`), and with the lid closed it puts the Mac
+to sleep like the other floor-rule ends: without that sleep the end would
+switch Low Power Mode off and unfreeze the apps of a Mac still running in the
+bag. The stretch is timed from the first floor run that reads it, and any
+reading below `serious` breaks it. The thermal state sends no event while it
+stays serious, so after each floor run the driver reports when the stretch
+reaches the limit and `AppServices` runs the floors once more at that moment.
+Once it has, no new wait is owed: an end the lock or a running `sudo pmset`
+refuses is retried by the manager. The limit is set in Settings in 5-minute
+steps from 0 to 60 minutes; a hand-edited `config.json` outside that range is
+clamped at load, logged and written back.
 
 Insomnia does not enable Low Power Mode merely because a session starts; the
 causes are the battery floor, a serious thermal state, and (by default) a closed
@@ -1107,10 +1124,11 @@ older build is tightened when the app reads it:
   earlier builds read it. A fresh install writes a config.json with the mark
   and the new defaults and shows no notice.
 - agent list (bundle ids), turn App Nap off for them on/off (default off)
-- `lowPowerFloor`, `endFloor`, thermal rules on/off. A change to any of
-  them, or to the lid option, during a session runs the floors at once:
-  `SessionManager.config` calls `floorInputsChanged` when `Config.floorInputs`
-  changes, and `AppServices` runs `reevaluateFloors` for it.
+- `lowPowerFloor`, `endFloor`, thermal rules on/off, `seriousThermalLimit`
+  (default 15 minutes, 0 off). A change to any of them, or to the lid
+  option, during a session runs the floors at once: `SessionManager.config`
+  calls `floorInputsChanged` when `Config.floorInputs` changes, and
+  `AppServices` runs `reevaluateFloors` for it.
 - hotspot SSID (password entered once, stored in Keychain), `nudgeThreshold`
 - tmux targets, `tmuxNudgePressesEnter` (default off)
 - launch at login (`SMAppService.mainApp`). macOS ties the login item to
@@ -1240,6 +1258,7 @@ transitions. If it feels like a web dropdown, it is wrong.
 | battery % | IOPS run loop source | none |
 | battery unreadable | re-read every 30 s | one wake per 30 s, only while a session runs and the battery is unreadable |
 | thermal | `ProcessInfo` notification | none |
+| serious heat limit | one wait after each floor run while the thermal state reads serious | one wake when the stretch reaches `seriousThermalLimit` |
 | network path | `NWPathMonitor` | none |
 | session deadline | one in-app timer plus independent launchd recovery | recovery checks may wake periodically |
 | countdown redraw | 1 Hz timer, stopped while lid closed | one wake per second while active and visible |
@@ -1393,8 +1412,9 @@ validation record.
     Plug in charger → off. Set `endFloor` above current charge → session ends.
 12. **Thermal.** Exercise injected thermal events first; verify responses to
     `serious`, `critical`, and recovery: Low Power Mode stays on at `fair`
-    after `serious` and goes off at `nominal`. Do not intentionally overheat
-    the Mac.
+    after `serious` and goes off at `nominal`, and `serious` held for
+    `seriousThermalLimit` ends the session. Do not intentionally overheat the
+    Mac.
 13. **Darken.** Brightness 70%, keyboard backlight on, close lid → both go to
     0 (check `state.json` has `savedDisplayBrightness` and
     `savedKeyboardBrightness`). Open → both back, journal entries gone. Repeat
@@ -1435,7 +1455,10 @@ validation record.
 
 - `pmset -a` (all power sources) rather than `-b` for `disablesleep`, so
   behaviour is identical whether or not a charger is attached.
-- Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s.
+- Default `lowPowerFloor` 40%, `endFloor` 10%, `nudgeThreshold` 90 s,
+  `seriousThermalLimit` 15 minutes, also for an existing config.json without
+  the key: heat that bad for that long is a reason to stop holding sleep on
+  any install, and Settings can turn it off.
 - Turning App Nap off for agent apps is opt-in and the previous value is put
   back at session end. Values older builds wrote without a record are listed
   by uninstall, never deleted by it.

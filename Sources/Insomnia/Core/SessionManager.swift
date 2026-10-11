@@ -10,6 +10,9 @@ enum EndReason: String, Sendable {
     /// while on battery: the end floor could not be applied.
     case batteryUnreadable
     case thermalCritical
+    /// The thermal state stayed serious, without a break, for
+    /// `Config.seriousThermalLimit`.
+    case thermalSustained
     case backstop
     /// Reconcile found a session on disk but could not arm the recovery
     /// agent, journal, or hold sleep for it, so it ended the session instead
@@ -24,7 +27,7 @@ enum EndReason: String, Sendable {
     /// closed they also ask macOS to sleep (`SessionManager.sleepClosedLidIfOwed`).
     var sleepsAClosedLid: Bool {
         switch self {
-        case .thermalCritical, .batteryFloor, .batteryUnreadable: true
+        case .thermalCritical, .thermalSustained, .batteryFloor, .batteryUnreadable: true
         case .timer, .user, .quit, .backstop, .recoveryUnavailable, .startFailed: false
         }
     }
@@ -445,9 +448,10 @@ final class SessionManager {
     /// event once the lid debounce has settled, and runs the floor rules
     /// on the corrected journal. nil in tests that do not wire it.
     var resyncAfterCommand: (@MainActor (_ replayLid: Bool) -> Void)?
-    /// Called when `config` changes a battery floor, the thermal rules or
-    /// the lid option (`Config.floorInputs`): `AppServices` runs the floors
-    /// at once (`reevaluateFloors`). nil in tests that do not wire it.
+    /// Called when `config` changes a battery floor, the thermal rules, the
+    /// serious heat limit or the lid option (`Config.floorInputs`):
+    /// `AppServices` runs the floors at once (`reevaluateFloors`). nil in
+    /// tests that do not wire it.
     var floorInputsChanged: (@MainActor () -> Void)?
     /// How far the panel may have drifted from a value written under Low
     /// Power Mode (auto-brightness moves it slowly) and still count as
@@ -620,6 +624,7 @@ final class SessionManager {
             // Settings keeps the end floor below the Low Power Mode floor; a
             // hand-edited config.json may not. Fix it here and write it back.
             var corrections = c.normalizeFloors().map { [$0] } ?? []
+            if let limit = c.normalizeSeriousThermalLimit() { corrections.append(limit) }
             // Once for a config.json an earlier build saved: written back
             // with the mark, so a setting the user turns back stays back.
             let earlierBuild = !c.lidCloseDefaultsApplied
@@ -3259,6 +3264,10 @@ final class SessionManager {
         case .batteryFloor: "Battery fell below \(config.endFloor)%. Sleep is back to normal."
         case .batteryUnreadable: "The battery level could not be read twice in a row, so the \(config.endFloor)% floor could not be applied. Sleep is back to normal."
         case .thermalCritical: "Thermal state is critical. Sleep is back to normal."
+        // The limit may have been turned off between a refused end and its retry.
+        case .thermalSustained: config.seriousThermalLimit > 0
+            ? "Thermal state stayed serious for \(Config.seriousThermalLimitText(config.seriousThermalLimit)). Sleep is back to normal."
+            : "Thermal state stayed serious too long. Sleep is back to normal."
         case .backstop: outputsWaiting
             ? "A previous session left changes behind. Sleep is back to normal."
             : "A previous session left changes behind; everything has been undone."
