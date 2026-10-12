@@ -53,7 +53,7 @@ final class ClosedLidSleepTests: XCTestCase {
     /// the bag that critical rarely reaches: the end asks for sleep too.
     func testSustainedSeriousHeatWithTheLidClosedEndsTheSessionAndAsksForSleep() async throws {
         let m = await sessionWithTheLidClosed(h)
-        let clock = h.clock
+        let clock = FakeContinuousClock()
         let driver = FloorRuleDriver(manager: m, notifier: h.notifier, clock: { clock.now })
 
         await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: true)

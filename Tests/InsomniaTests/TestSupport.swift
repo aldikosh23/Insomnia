@@ -813,6 +813,14 @@ final class FakeClock: @unchecked Sendable {
     func advance(_ seconds: TimeInterval) { now = now.addingTimeInterval(seconds) }
 }
 
+/// A continuous clock a test moves by hand, apart from the wall clock.
+final class FakeContinuousClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _now = ContinuousClock.now
+    var now: ContinuousClock.Instant { lock.withLock { _now } }
+    func advance(_ seconds: TimeInterval) { lock.withLock { _now = _now.advanced(by: .seconds(seconds)) } }
+}
+
 @MainActor
 struct Harness {
     let home: TempHome

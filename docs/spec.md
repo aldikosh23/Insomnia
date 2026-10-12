@@ -670,8 +670,10 @@ with Low Power Mode on. A `serious` stretch that lasts `seriousThermalLimit`
 ends the session (`thermalSustained`), and with the lid closed it puts the Mac
 to sleep like the other floor-rule ends: without that sleep the end would
 switch Low Power Mode off and unfreeze the apps of a Mac still running in the
-bag. The stretch is timed from the first floor run that reads it, and any
-reading below `serious` breaks it. The thermal state sends no event while it
+bag. The stretch is timed from the first floor run that reads it, on the
+continuous clock like the wait below, so a step of the wall clock (an NTP
+correction, a time set by hand) does not count, and any reading below
+`serious` breaks it. The thermal state sends no event while it
 stays serious, so after each floor run the driver reports when the stretch
 reaches the limit and `AppServices` runs the floors once more at that moment.
 Once it has, no new wait is owed: an end the lock or a running `sudo pmset`

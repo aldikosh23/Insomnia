@@ -118,7 +118,10 @@ struct FloorRuleDriver {
     /// after a relaunch a Mac at fair counts as cooled down, and a serious
     /// stretch is timed from the first run that reads it.
     private let heatLog = HeatLog()
-    private let clock: @Sendable () -> Date
+    /// Times the serious stretch. The continuous clock, like the wait that
+    /// runs the floors at the limit: a step of the wall clock (an NTP
+    /// correction, a time set by hand) moves neither.
+    private let clock: @Sendable () -> ContinuousClock.Instant
     /// Called at the end of each run with the seconds until the serious
     /// stretch reaches `seriousThermalLimit`, or nil when no run is owed
     /// then: the thermal state sends no event while it stays serious, so
@@ -134,11 +137,11 @@ struct FloorRuleDriver {
     private final class HeatLog {
         var hot = false
         /// When the current serious stretch was first read.
-        var seriousSince: Date?
+        var seriousSince: ContinuousClock.Instant?
 
         /// Records the state a run reads at `now` and returns the heat the
         /// rules see for that run.
-        func read(_ thermal: ProcessInfo.ThermalState, at now: Date) -> (hot: Bool, seriousFor: TimeInterval?) {
+        func read(_ thermal: ProcessInfo.ThermalState, at now: ContinuousClock.Instant) -> (hot: Bool, seriousFor: TimeInterval?) {
             switch thermal {
             case .serious, .critical:
                 hot = true
@@ -149,14 +152,19 @@ struct FloorRuleDriver {
             default:
                 seriousSince = nil
             }
-            return (hot, seriousSince.map { now.timeIntervalSince($0) })
+            return (hot, seriousSince.map { Self.seconds(now - $0) })
+        }
+
+        static func seconds(_ duration: Duration) -> TimeInterval {
+            let parts = duration.components
+            return TimeInterval(parts.seconds) + TimeInterval(parts.attoseconds) / 1e18
         }
     }
 
     init(
         manager: SessionManager,
         notifier: any Notifying,
-        clock: @escaping @Sendable () -> Date = { Date() },
+        clock: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now },
         recheck: @escaping @MainActor (TimeInterval?) -> Void = { _ in }
     ) {
         self.manager = manager
@@ -233,7 +241,7 @@ struct FloorRuleDriver {
         guard let manager, manager.isActive, let since = heatLog.seriousSince else { return nil }
         let config = manager.config
         guard config.thermalRules, config.seriousThermalLimit > 0 else { return nil }
-        let left = config.seriousThermalLimit - clock().timeIntervalSince(since)
+        let left = config.seriousThermalLimit - HeatLog.seconds(clock() - since)
         return left > 0 ? left : nil
     }
 }

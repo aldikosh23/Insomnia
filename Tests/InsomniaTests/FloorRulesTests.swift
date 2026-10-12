@@ -631,9 +631,13 @@ final class FloorRuleDriverTests: XCTestCase {
         var waits: [TimeInterval?] = []
     }
 
+    /// The serious stretch is timed on `heat`, a continuous clock apart
+    /// from the wall clock the manager reads (`h.clock`).
+    private let heat = FakeContinuousClock()
+
     private func driver(_ m: SessionManager, _ log: RecheckLog) -> FloorRuleDriver {
-        let clock = h.clock
-        return FloorRuleDriver(manager: m, notifier: h.notifier, clock: { clock.now }, recheck: { log.waits.append($0) })
+        let heat = heat
+        return FloorRuleDriver(manager: m, notifier: h.notifier, clock: { heat.now }, recheck: { log.waits.append($0) })
     }
 
     /// Serious heat that lasts the limit ends the session through the
@@ -648,12 +652,12 @@ final class FloorRuleDriverTests: XCTestCase {
 
         await driver.run(battery: .percent(80), isCharging: false, thermal: .serious, lidClosed: true)
         XCTAssertTrue(h.guardFake.lowPowerOn)
-        h.clock.advance(10 * 60)
+        heat.advance(10 * 60)
         await driver.run(battery: .percent(78), isCharging: false, thermal: .serious, lidClosed: true)
         XCTAssertTrue(m.isActive)
         XCTAssertEqual(log.waits, [15 * 60, 5 * 60])
 
-        h.clock.advance(5 * 60)
+        heat.advance(5 * 60)
         await driver.run(battery: .percent(77), isCharging: false, thermal: .serious, lidClosed: true)
         XCTAssertFalse(m.isActive)
         XCTAssertNil(try h.store.loadSession())
@@ -671,16 +675,16 @@ final class FloorRuleDriverTests: XCTestCase {
         let log = RecheckLog()
         let driver = driver(m, log)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
-        h.clock.advance(14 * 60)
+        heat.advance(14 * 60)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .fair, lidClosed: false)
-        h.clock.advance(60)
+        heat.advance(60)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
-        h.clock.advance(14 * 60)
+        heat.advance(14 * 60)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
         XCTAssertTrue(m.isActive, "the stretch before the break counted toward the limit")
         XCTAssertEqual(log.waits, [15 * 60, nil, 15 * 60, 60])
 
-        h.clock.advance(60)
+        heat.advance(60)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
         XCTAssertFalse(m.isActive)
     }
@@ -694,7 +698,7 @@ final class FloorRuleDriverTests: XCTestCase {
         let log = RecheckLog()
         let driver = driver(m, log)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
-        h.clock.advance(6 * 60)
+        heat.advance(6 * 60)
         m.config.seriousThermalLimit = 0
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
         m.config.seriousThermalLimit = 15 * 60
@@ -710,6 +714,22 @@ final class FloorRuleDriverTests: XCTestCase {
         XCTAssertEqual(h.notifier.posts.last?.body, "Thermal state stayed serious for 5 minutes. Sleep is back to normal.")
     }
 
+    /// A step of the wall clock is not heat: the manager's clock jumps 20
+    /// minutes ahead, as an NTP correction or a time set by hand would,
+    /// while 5 minutes pass, and the session stays with 10 minutes to go.
+    func testAWallClockStepDoesNotCountTowardTheLimit() async throws {
+        let m = h.makeManager()
+        await m.start(duration: 3600)
+        let log = RecheckLog()
+        let driver = driver(m, log)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        h.clock.advance(20 * 60)
+        heat.advance(5 * 60)
+        await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
+        XCTAssertTrue(m.isActive)
+        XCTAssertEqual(log.waits, [15 * 60, 10 * 60])
+    }
+
     /// An end at the limit that the recovery lock refuses keeps the
     /// session, and the run owes no new wait: the manager retries the end
     /// itself, so nothing asks for it every second.
@@ -722,7 +742,7 @@ final class FloorRuleDriverTests: XCTestCase {
         let other = try XCTUnwrap(try RecoveryLock(url: h.home.paths.recoveryLock).tryAcquire())
         defer { other.release() }
 
-        h.clock.advance(15 * 60)
+        heat.advance(15 * 60)
         await driver.run(battery: .percent(80), isCharging: true, thermal: .serious, lidClosed: false)
 
         XCTAssertTrue(m.isActive)
